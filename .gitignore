@@ -7,7 +7,14 @@ node_modules/
 *.log
 *.tmp
 .idea/
+*.suo
+*.user
 *.iml
 dist/
 out/
 *.out
+*.exe
+*.dll
+*.so
+*.a
+*.lib
