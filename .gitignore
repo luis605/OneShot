@@ -1,0 +1,13 @@
+build/
+libs/
+.vscode/
+.DS_Store
+node_modules/
+.env
+*.log
+*.tmp
+.idea/
+*.iml
+dist/
+out/
+*.out
