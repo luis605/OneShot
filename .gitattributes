@@ -1,5 +1,6 @@
 *.cpp       filter=git-crypt diff=git-crypt
 *.hpp       filter=git-crypt diff=git-crypt
+*.h       filter=git-crypt diff=git-crypt
 *.cppm      filter=git-crypt diff=git-crypt
 *.md        filter=git-crypt diff=git-crypt
 *.txt       filter=git-crypt diff=git-crypt
