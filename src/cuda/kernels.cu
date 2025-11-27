@@ -19,35 +19,21 @@ __global__ void updateSynapsesKernel(SynapseDataGPU synapses) {
 
     // Reset arrival flag
     synapses.justArrived[idx] = 0;
+
     // Get delay buffer info
     int delayLen = synapses.delayLength[idx];
     int cursor = synapses.bufferCursor[idx];
-    int bufferOffset = idx * synapses.maxDelayLength;
 
     // Check for spike arrival
     uint8_t signal = synapses.delayBuffer[idx * synapses.maxDelayLength + cursor];
 
-    // Update visual conductance (decay)
-    float visualCond = synapses.visualConductance[idx];
-    visualCond *= 0.8f;
-
     if (signal == 1) {
         synapses.justArrived[idx] = 1;
-        visualCond = 1.0f;
-    } else {
-        synapses.justArrived[idx] = 0;
     }
-
-    synapses.visualConductance[idx] = visualCond;
-
-    // Update delay buffer (write new spike if pending)
 
     // Decay pre-synaptic trace
     float decay_factor = 1.0f - (d_constants.dt / d_constants.tau_trace_pre);
     synapses.preTrace[idx] *= decay_factor;
-
-    // Decay visual conductance
-    synapses.visualConductance[idx] *= 0.8f;
 
     // Advance circular buffer cursor
     synapses.bufferCursor[idx] = (cursor + 1) % delayLen;
@@ -81,7 +67,10 @@ __global__ void accumulateConductancesKernel(
     if (!synapses.justArrived[synIdx]) return;
 
     int targetNeuronIdx = synapses.targetNeuronIndex[synIdx];
-    float weight = synapses.weight[synIdx];
+
+    // Convert uint16_t to __half, then to FP32 for computation
+    __half* weightPtr = reinterpret_cast<__half*>(&synapses.weight[synIdx]);
+    float weight = __half2float(*weightPtr);
 
     // Atomic add to target neuron's conductance buffer
     if (synapses.type[synIdx] == 0) {  // GLUTAMATE
@@ -221,10 +210,15 @@ __global__ void stdpDepressionKernel(
 
     // LTD: if post-synaptic neuron has recent activity, weaken synapse
     if (postTrace > 0.1f) {
-        float weight = synapses.weight[idx];
+        // Convert uint16_t to __half, then to FP32 for computation
+        __half* weightPtr = reinterpret_cast<__half*>(&synapses.weight[idx]);
+        float weight = __half2float(*weightPtr);
         weight -= d_constants.learning_rate * postTrace;
         weight = fmaxf(weight, 0.0f);  // Clamp to non-negative
-        synapses.weight[idx] = weight;
+
+        // Convert back to FP16 and store as uint16_t
+        __half hw = __float2half(weight);
+        synapses.weight[idx] = *reinterpret_cast<uint16_t*>(&hw);
     }
 }
 
@@ -274,13 +268,18 @@ __global__ void stdpPotentiationKernel(
 
     // LTP: if target neuron just spiked and synapse has pre-trace, strengthen
     if (neurons.didSpike[targetIdx] && synapses.preTrace[idx] > 0.1f) {
-        float weight = synapses.weight[idx];
-        float maxWeight = synapses.maxWeight[idx];
+        // Convert uint16_t to __half, then to FP32 for computation
+        __half* weightPtr = reinterpret_cast<__half*>(&synapses.weight[idx]);
+        __half* maxWeightPtr = reinterpret_cast<__half*>(&synapses.maxWeight[idx]);
+        float weight = __half2float(*weightPtr);
+        float maxWeight = __half2float(*maxWeightPtr);
 
         weight += d_constants.learning_rate * synapses.preTrace[idx];
         weight = fminf(weight, maxWeight);  // Clamp to max
 
-        synapses.weight[idx] = weight;
+        // Convert back to FP16 and store as uint16_t
+        __half hw = __float2half(weight);
+        synapses.weight[idx] = *reinterpret_cast<uint16_t*>(&hw);
     }
 }
 
@@ -450,12 +449,16 @@ __global__ void collectActiveSynapsesKernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= synapses.numSynapses) return;
 
-    if (synapses.visualConductance[idx] > 0.2f) { // Threshold
+    // Compute visual conductance on-the-fly based on recent activity
+    // Use justArrived flag as proxy for visualization
+    float visualCond = synapses.justArrived[idx] ? 1.0f : 0.0f;
+
+    if (visualCond > 0.2f) { // Threshold
         int pos = atomicAdd(d_count, 1);
         if (pos < maxSynapses) {
             d_sourceIndices[pos] = synapses.sourceNeuronIndex[idx];
             d_targetIndices[pos] = synapses.targetNeuronIndex[idx];
-            d_conductances[pos] = synapses.visualConductance[idx];
+            d_conductances[pos] = visualCond;
         }
     }
 }

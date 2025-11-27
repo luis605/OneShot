@@ -38,6 +38,7 @@ void allocateSynapseDataGPU(SynapseDataGPU& data, int numSynapses, int maxDelayL
     data.maxDelayLength = maxDelayLength;
 
     size_t floatBytes = numSynapses * sizeof(float);
+    size_t halfBytes = numSynapses * sizeof(uint16_t);  // FP16 stored as uint16_t
     size_t intBytes = numSynapses * sizeof(int);
     size_t uint8Bytes = numSynapses * sizeof(uint8_t);
     size_t delayBufferBytes = numSynapses * maxDelayLength * sizeof(uint8_t);
@@ -46,13 +47,12 @@ void allocateSynapseDataGPU(SynapseDataGPU& data, int numSynapses, int maxDelayL
     CUDA_CHECK(cudaMalloc(&data.targetNeuronIndex, intBytes));
     CUDA_CHECK(cudaMalloc(&data.sourceNeuronIndex, intBytes));
 
-    // Weights
-    CUDA_CHECK(cudaMalloc(&data.weight, floatBytes));
-    CUDA_CHECK(cudaMalloc(&data.maxWeight, floatBytes));
+    // Weights (FP16 for memory efficiency)
+    CUDA_CHECK(cudaMalloc(&data.weight, halfBytes));
+    CUDA_CHECK(cudaMalloc(&data.maxWeight, halfBytes));
 
     // Traces
     CUDA_CHECK(cudaMalloc(&data.preTrace, floatBytes));
-    CUDA_CHECK(cudaMalloc(&data.visualConductance, floatBytes));
 
     // Type
     CUDA_CHECK(cudaMalloc(&data.type, uint8Bytes));
@@ -145,8 +145,8 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
     // Temporary host buffers in SoA layout
     std::vector<int> targetNeuronIndex(totalSynapses);
     std::vector<int> sourceNeuronIndex(totalSynapses);
-    std::vector<float> weight(totalSynapses), maxWeight(totalSynapses);
-    std::vector<float> preTrace(totalSynapses), visualConductance(totalSynapses);
+    std::vector<uint16_t> weight(totalSynapses), maxWeight(totalSynapses);  // FP16 as uint16_t
+    std::vector<float> preTrace(totalSynapses);
     std::vector<uint8_t> type(totalSynapses);
     std::vector<int> delayLength(totalSynapses), bufferCursor(totalSynapses);
     std::vector<uint8_t> incomingSpike(totalSynapses), justArrived(totalSynapses);
@@ -159,10 +159,14 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
         for (const auto& synapse : neuron.axon) {
             targetNeuronIndex[synapseIdx] = synapse.targetNeuronIndex;
             sourceNeuronIndex[synapseIdx] = neuronIdx; // Store source index
-            weight[synapseIdx] = (float)synapse.weight;
-            maxWeight[synapseIdx] = (float)synapse.maxWeight;
+
+            // Convert FP32 to FP16 (stored as uint16_t)
+            __half hw = __float2half((float)synapse.weight);
+            __half hmw = __float2half((float)synapse.maxWeight);
+            weight[synapseIdx] = *reinterpret_cast<uint16_t*>(&hw);
+            maxWeight[synapseIdx] = *reinterpret_cast<uint16_t*>(&hmw);
+
             preTrace[synapseIdx] = (float)synapse.preTrace;
-            visualConductance[synapseIdx] = (float)synapse.visualConductance;
             type[synapseIdx] = (synapse.type == GLUTAMATE) ? 0 : 1;
             delayLength[synapseIdx] = synapse.delayBuffer.size();
             bufferCursor[synapseIdx] = synapse.bufferCursor;
@@ -182,17 +186,16 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
 
     // Transfer to GPU
     size_t floatBytes = totalSynapses * sizeof(float);
+    size_t halfBytes = totalSynapses * sizeof(uint16_t);
     size_t intBytes = totalSynapses * sizeof(int);
     size_t uint8Bytes = totalSynapses * sizeof(uint8_t);
     size_t delayBufferBytes = totalSynapses * gpuData.maxDelayLength * sizeof(uint8_t);
 
     CUDA_CHECK(cudaMemcpy(gpuData.targetNeuronIndex, targetNeuronIndex.data(), intBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.sourceNeuronIndex, sourceNeuronIndex.data(), intBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.weight, weight.data(), floatBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.weight, weight.data(), floatBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.maxWeight, maxWeight.data(), floatBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpuData.weight, weight.data(), halfBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpuData.maxWeight, maxWeight.data(), halfBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.preTrace, preTrace.data(), floatBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.visualConductance, visualConductance.data(), floatBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.type, type.data(), uint8Bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.delayLength, delayLength.data(), intBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.bufferCursor, bufferCursor.data(), intBytes, cudaMemcpyHostToDevice));
@@ -256,20 +259,6 @@ void copyNeuronDataFromGPU(std::vector<Neuron>& cpuNeurons, const NeuronDataGPU&
     }
 }
 
-void copySynapseDataFromGPU(std::vector<float>& visualConductance, const SynapseDataGPU& gpuData) {
-    int totalSynapses = gpuData.numSynapses;
-    if (totalSynapses == 0) return;
-
-    // Resize if necessary (should be pre-sized but safe to check)
-    if (visualConductance.size() != totalSynapses) {
-        visualConductance.resize(totalSynapses);
-    }
-
-    // Direct copy from GPU to flat host buffer - NO SCATTER LOOP
-    CUDA_CHECK(cudaMemcpy(visualConductance.data(), gpuData.visualConductance,
-                         totalSynapses * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
 // ============================================================================
 // Cleanup Functions
 // ============================================================================
@@ -295,7 +284,6 @@ void freeSynapseDataGPU(SynapseDataGPU& data) {
     CUDA_CHECK(cudaFree(data.weight));
     CUDA_CHECK(cudaFree(data.maxWeight));
     CUDA_CHECK(cudaFree(data.preTrace));
-    CUDA_CHECK(cudaFree(data.visualConductance));
     CUDA_CHECK(cudaFree(data.type));
     CUDA_CHECK(cudaFree(data.delayBuffer));
     CUDA_CHECK(cudaFree(data.delayLength));
