@@ -20,23 +20,11 @@ __global__ void updateSynapsesKernel(SynapseDataGPU synapses) {
     // Reset arrival flag
     synapses.justArrived[idx] = 0;
 
-    // Get delay buffer info
-    int delayLen = synapses.delayLength[idx];
-    int cursor = synapses.bufferCursor[idx];
-
-    // Check for spike arrival
-    uint8_t signal = synapses.delayBuffer[idx * synapses.maxDelayLength + cursor];
-
-    if (signal == 1) {
-        synapses.justArrived[idx] = 1;
-    }
+    // Delay buffer logic removed - handled by DelayQueueGPU
 
     // Decay pre-synaptic trace
     float decay_factor = 1.0f - (d_constants.dt / d_constants.tau_trace_pre);
     synapses.preTrace[idx] *= decay_factor;
-
-    // Advance circular buffer cursor
-    synapses.bufferCursor[idx] = (cursor + 1) % delayLen;
 }
 
 // ============================================================================
@@ -49,6 +37,29 @@ __global__ void clearConductancesKernel(ConductanceBuffersGPU buffers) {
 
     buffers.g_exc[neuronIdx] = 0.0f;
     buffers.g_inh[neuronIdx] = 0.0f;
+}
+
+// ============================================================================
+// Kernel: Process Delay Queue (TimeSlot Approach)
+// ============================================================================
+
+__global__ void processDelayQueueKernel(
+    DelayQueueGPU queue,
+    SynapseDataGPU synapses,
+    int currentStep
+) {
+    int slot = currentStep % queue.numSlots;
+    int count = queue.slotCounts[slot];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    // Get synapse index from slot data
+    int synIdx = queue.slotData[slot * queue.slotCapacity + idx];
+
+    // Mark as arrived
+    synapses.justArrived[synIdx] = 1;
+    synapses.incomingSpike[synIdx] = 0; // Clear pending flag
 }
 
 // ============================================================================
@@ -229,7 +240,9 @@ __global__ void stdpDepressionKernel(
 __global__ void processSpikeKernel(
     NeuronDataGPU neurons,
     SynapseDataGPU synapses,
-    SynapseConnectivityGPU connectivity
+    SynapseConnectivityGPU connectivity,
+    DelayQueueGPU queue,
+    int currentStep
 ) {
     int neuronIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (neuronIdx >= neurons.numNeurons) return;
@@ -246,10 +259,19 @@ __global__ void processSpikeKernel(
         // Increment pre-synaptic trace
         synapses.preTrace[synIdx] += 1.0f;
 
-        // Write spike into delay buffer at current cursor
-        int cursor = synapses.bufferCursor[synIdx];
-        int bufferOffset = synIdx * synapses.maxDelayLength;
-        synapses.delayBuffer[bufferOffset + cursor] = 1;
+        // Enqueue spike
+        int delay = synapses.delayLength[synIdx];
+        int arrivalStep = currentStep + delay;
+        int slot = arrivalStep % queue.numSlots;
+
+        // Atomic add to slot count
+        int pos = atomicAdd(&queue.slotCounts[slot], 1);
+
+        // Write to slot data if within capacity
+        if (pos < queue.slotCapacity) {
+            queue.slotData[slot * queue.slotCapacity + pos] = synIdx;
+            synapses.incomingSpike[synIdx] = 1; // Mark as pending
+        }
     }
 }
 
@@ -364,6 +386,41 @@ extern "C" void launchClearConductances(ConductanceBuffersGPU buffers) {
     clearConductancesKernel<<<numBlocks, blockSize>>>(buffers);
 }
 
+extern "C" void launchProcessDelayQueue(
+    DelayQueueGPU queue,
+    SynapseDataGPU synapses,
+    int currentStep
+) {
+    int slot = currentStep % queue.numSlots;
+
+    // We need to copy the count from device to host to know how many threads to launch
+    // This introduces a small latency, but it's necessary.
+    // Alternatively, we could launch a fixed number of threads and have them check bounds,
+    // but copying one int is fast.
+    int count = 0;
+    cudaMemcpy(&count, &queue.slotCounts[slot], sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Clamp count to capacity to avoid out-of-bounds read
+    int processCount = count;
+    if (processCount > queue.slotCapacity) {
+        printf("WARNING: Delay Queue Overflow in slot %d! Count: %d, Capacity: %d. Spikes will be dropped.\n", slot, count, queue.slotCapacity);
+        processCount = queue.slotCapacity;
+    }
+
+    if (processCount > 0) {
+        int blockSize = 256;
+        int numBlocks = (processCount + blockSize - 1) / blockSize;
+        processDelayQueueKernel<<<numBlocks, blockSize>>>(queue, synapses, currentStep);
+    }
+
+    // Reset the count for this slot for the next cycle (e.g. currentStep + numSlots)
+    // We do this AFTER processing.
+    // Wait, we need to be careful. If we reset it here, we must ensure the kernel is done?
+    // cudaMemcpy is synchronous w.r.t host, but kernel launch is async.
+    // We should launch a separate kernel to reset the count or use cudaMemsetAsync.
+    cudaMemsetAsync(&queue.slotCounts[slot], 0, sizeof(int));
+}
+
 extern "C" void launchAccumulateConductances(
     SynapseDataGPU synapses,
     ConductanceBuffersGPU buffers
@@ -399,11 +456,13 @@ extern "C" void launchStdpDepression(SynapseDataGPU synapses, NeuronDataGPU neur
 extern "C" void launchProcessSpikes(
     NeuronDataGPU neurons,
     SynapseDataGPU synapses,
-    SynapseConnectivityGPU connectivity
+    SynapseConnectivityGPU connectivity,
+    DelayQueueGPU queue,
+    int currentStep
 ) {
     int blockSize = 256;
     int numBlocks = (neurons.numNeurons + blockSize - 1) / blockSize;
-    processSpikeKernel<<<numBlocks, blockSize>>>(neurons, synapses, connectivity);
+    processSpikeKernel<<<numBlocks, blockSize>>>(neurons, synapses, connectivity, queue, currentStep);
 }
 
 extern "C" void launchStdpPotentiation(SynapseDataGPU synapses, NeuronDataGPU neurons) {

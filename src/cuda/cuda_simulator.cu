@@ -1,4 +1,5 @@
 #include "cuda/cuda_simulator.hpp"
+#include "cuda/cuda_memory.hpp" // Added for memory functions
 #include "utils.hpp"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -53,6 +54,10 @@ void CUDASimulator::initialize(const std::vector<Neuron>& cpuNeurons, int numNeu
     CUDA_CHECK(cudaMalloc(&d_voltageSum, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_sensitivitySum, sizeof(float)));
 
+    // Allocate Delay Queue (Phase 2)
+    // 64 slots * 1M capacity = 64M integers = 256 MB
+    allocateDelayQueueGPU(m_delayQueue, 1000000);
+
     // Allocate RNG states
     CUDA_CHECK(cudaMalloc(&d_rngStates, numNeurons * sizeof(curandState)));
 
@@ -100,8 +105,11 @@ void CUDASimulator::step() {
         return;
     }
 
-    // Step 1: Update synapses (delay buffers, spike arrival detection)
+    // Step 1: Update synapses (decay traces)
     launchUpdateSynapses(m_synapses);
+
+    // Step 1.5: Process Delay Queue (New Phase 2)
+    launchProcessDelayQueue(m_delayQueue, m_synapses, m_ticks);
 
     // Step 2: Clear conductance buffers
     launchClearConductances(m_conductances);
@@ -121,8 +129,8 @@ void CUDASimulator::step() {
     // Step 6: Apply STDP depression (LTD)
     launchStdpDepression(m_synapses, m_neurons);
 
-    // Step 7: Propagate new spikes to delay buffers
-    launchProcessSpikes(m_neurons, m_synapses, m_connectivity);
+    // Step 7: Propagate new spikes to delay queue
+    launchProcessSpikes(m_neurons, m_synapses, m_connectivity, m_delayQueue, m_ticks);
 
     // Step 8: Apply STDP potentiation (LTP)
     launchStdpPotentiation(m_synapses, m_neurons);
@@ -214,6 +222,7 @@ void CUDASimulator::cleanup() {
     freeSynapseDataGPU(m_synapses);
     freeSynapseConnectivityGPU(m_connectivity);
     freeConductanceBuffersGPU(m_conductances);
+    freeDelayQueueGPU(m_delayQueue);
 
     CUDA_CHECK(cudaFree(d_voltageSum));
     CUDA_CHECK(cudaFree(d_sensitivitySum));

@@ -41,7 +41,6 @@ void allocateSynapseDataGPU(SynapseDataGPU& data, int numSynapses, int maxDelayL
     size_t halfBytes = numSynapses * sizeof(uint16_t);  // FP16 stored as uint16_t
     size_t intBytes = numSynapses * sizeof(int);
     size_t uint8Bytes = numSynapses * sizeof(uint8_t);
-    size_t delayBufferBytes = numSynapses * maxDelayLength * sizeof(uint8_t);
 
     // Connectivity
     CUDA_CHECK(cudaMalloc(&data.targetNeuronIndex, intBytes));
@@ -57,10 +56,8 @@ void allocateSynapseDataGPU(SynapseDataGPU& data, int numSynapses, int maxDelayL
     // Type
     CUDA_CHECK(cudaMalloc(&data.type, uint8Bytes));
 
-    // Delay buffers
-    CUDA_CHECK(cudaMalloc(&data.delayBuffer, delayBufferBytes));
+    // Delay management (Sparse Queue Approach)
     CUDA_CHECK(cudaMalloc(&data.delayLength, intBytes));
-    CUDA_CHECK(cudaMalloc(&data.bufferCursor, intBytes));
 
     // Flags
     CUDA_CHECK(cudaMalloc(&data.incomingSpike, uint8Bytes));
@@ -148,9 +145,8 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
     std::vector<uint16_t> weight(totalSynapses), maxWeight(totalSynapses);  // FP16 as uint16_t
     std::vector<float> preTrace(totalSynapses);
     std::vector<uint8_t> type(totalSynapses);
-    std::vector<int> delayLength(totalSynapses), bufferCursor(totalSynapses);
+    std::vector<int> delayLength(totalSynapses);
     std::vector<uint8_t> incomingSpike(totalSynapses), justArrived(totalSynapses);
-    std::vector<uint8_t> delayBuffer(totalSynapses * gpuData.maxDelayLength, 0);
 
     // Flatten synapse data
     int synapseIdx = 0;
@@ -169,15 +165,8 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
             preTrace[synapseIdx] = (float)synapse.preTrace;
             type[synapseIdx] = (synapse.type == GLUTAMATE) ? 0 : 1;
             delayLength[synapseIdx] = synapse.delayBuffer.size();
-            bufferCursor[synapseIdx] = synapse.bufferCursor;
             incomingSpike[synapseIdx] = synapse.incomingSpikePending ? 1 : 0;
             justArrived[synapseIdx] = synapse.justArrived ? 1 : 0;
-
-            // Copy delay buffer
-            int offset = synapseIdx * gpuData.maxDelayLength;
-            for (size_t j = 0; j < synapse.delayBuffer.size(); j++) {
-                delayBuffer[offset + j] = synapse.delayBuffer[j];
-            }
 
             synapseIdx++;
         }
@@ -189,7 +178,6 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
     size_t halfBytes = totalSynapses * sizeof(uint16_t);
     size_t intBytes = totalSynapses * sizeof(int);
     size_t uint8Bytes = totalSynapses * sizeof(uint8_t);
-    size_t delayBufferBytes = totalSynapses * gpuData.maxDelayLength * sizeof(uint8_t);
 
     CUDA_CHECK(cudaMemcpy(gpuData.targetNeuronIndex, targetNeuronIndex.data(), intBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.sourceNeuronIndex, sourceNeuronIndex.data(), intBytes, cudaMemcpyHostToDevice));
@@ -198,10 +186,8 @@ void copySynapseDataToGPU(SynapseDataGPU& gpuData, const std::vector<Neuron>& cp
     CUDA_CHECK(cudaMemcpy(gpuData.preTrace, preTrace.data(), floatBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.type, type.data(), uint8Bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.delayLength, delayLength.data(), intBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.bufferCursor, bufferCursor.data(), intBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.incomingSpike, incomingSpike.data(), uint8Bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gpuData.justArrived, justArrived.data(), uint8Bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuData.delayBuffer, delayBuffer.data(), delayBufferBytes, cudaMemcpyHostToDevice));
 }
 
 void buildSynapseConnectivityGPU(SynapseConnectivityGPU& connectivity, const std::vector<Neuron>& cpuNeurons) {
@@ -285,11 +271,29 @@ void freeSynapseDataGPU(SynapseDataGPU& data) {
     CUDA_CHECK(cudaFree(data.maxWeight));
     CUDA_CHECK(cudaFree(data.preTrace));
     CUDA_CHECK(cudaFree(data.type));
-    CUDA_CHECK(cudaFree(data.delayBuffer));
     CUDA_CHECK(cudaFree(data.delayLength));
-    CUDA_CHECK(cudaFree(data.bufferCursor));
     CUDA_CHECK(cudaFree(data.incomingSpike));
     CUDA_CHECK(cudaFree(data.justArrived));
+}
+
+void allocateDelayQueueGPU(DelayQueueGPU& data, int capacity) {
+    // capacity here is interpreted as slotCapacity
+    data.numSlots = 64; // Sufficient for maxDelay ~40
+    data.slotCapacity = capacity; // e.g., 1M
+
+    size_t countsBytes = data.numSlots * sizeof(int);
+    size_t dataBytes = (size_t)data.numSlots * (size_t)data.slotCapacity * sizeof(int);
+
+    CUDA_CHECK(cudaMalloc(&data.slotCounts, countsBytes));
+    CUDA_CHECK(cudaMalloc(&data.slotData, dataBytes));
+
+    // Initialize counts to zero
+    CUDA_CHECK(cudaMemset(data.slotCounts, 0, countsBytes));
+}
+
+void freeDelayQueueGPU(DelayQueueGPU& data) {
+    CUDA_CHECK(cudaFree(data.slotCounts));
+    CUDA_CHECK(cudaFree(data.slotData));
 }
 
 void freeSynapseConnectivityGPU(SynapseConnectivityGPU& connectivity) {
